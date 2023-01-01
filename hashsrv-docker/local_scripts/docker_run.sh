@@ -62,7 +62,7 @@ if [ ! -d ${DB_DIR} ]; then
 fi
 
 set -x
-ID=$(docker run -d -v /workdir:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock ${IMAGE_NAME} --bind :8687 --database ${DB_DIR}/hashserv.db --log WARNING)
+ID=$(docker run -d -v /workdir:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock ${IMAGE_NAME} --bind :8687 --database ${DB_DIR}/hashserv.db --log WARNING --read-only)
 set +x
 
 # set -x
