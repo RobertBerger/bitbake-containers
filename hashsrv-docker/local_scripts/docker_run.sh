@@ -2,6 +2,7 @@ source ../container-name.sh
 IMAGE_NAME=$1
 
 DB_DIR="/workdir/hashsvr"
+#DB_DIR="/appdata/hashsrv-langdale/workdir"
 PUBLIC_PORT="8687"
 
 if [ $# -lt 1 ];
@@ -62,13 +63,14 @@ if [ ! -d ${DB_DIR} ]; then
 fi
 
 set -x
-ID=$(docker run -d -v /workdir:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock ${IMAGE_NAME} --bind :8687 --database ${DB_DIR}/hashserv.db --log WARNING --read-only)
+#ID=$(docker run -d -v ${DB_DIR}:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock ${IMAGE_NAME} --bind :8687 --database /workdir/hashserv.db --log WARNING --read-only)
+ID=$(docker run -d -v ${DB_DIR}:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock ${IMAGE_NAME} --bind :8687 --database /workdir/hashserv.db --log WARNING)
 set +x
 
 # set -x
 # --> run shell in container
 #docker run -it ${IMAGE_NAME} /bin/sh
-#docker run -it --privileged -v /workdir:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock  ${IMAGE_NAME} /bin/sh
+#docker run -it --privileged -v ${DB_DIR}:/workdir -p ${PUBLIC_PORT}:8687 -v /var/run/docker.sock:/var/run/docker.sock  ${IMAGE_NAME} /bin/sh --login
 # <-- run shell in container
 # set +x
 
