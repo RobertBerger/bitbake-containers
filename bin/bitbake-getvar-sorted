@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2021 Richard Purdie
+# Copyright (C) 2026 Robert Berger <Robert.Berger@ReliableEmbeddedSystems.com>
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Fixes Chronological Confusion:
+# This script guarantees that the line marked [WINNER] at the bottom
+# is mathematically the true assignment based on BitBake parsing order.
+#
+# Low Overhead:
+# Uses optimized native string operations to parse the output stream.
+#
+# Modern Compatibility:
+# Tailored to handle modern Yocto syntax shifts and deep layer structures.
+#
+# ==============================================================================
+# BITBAKE EVALUATION-ORDER VISUALIZATION LEGEND
+# ==============================================================================
+# Each variable operation history block is appended with metadata tracking tags
+# structured as follows:
+#
+#   # <operation> <file_path>:<line> [<SCOPE>][Tier:<N> Override:<M> Layer Prio:<X> (<layer>)] [<STATUS>]
+# ------------------------------------------------------------------------------
+# 1. [<SCOPE>] INDICATOR:
+#    - [GLOBAL] : The variable was declared in a configuration (.conf/.cfg) file.
+#    - [LOCAL]  : The variable was declared in a recipe (.bb) or include (.inc).
+#
+# 2. [Tier:<N>] COMPILER PRECEDENCE RANKING:
+#    - Tier:1   : Weak Defaults (set? / ??=)
+#    - Tier:2   : Normal Defaults (set? / ?=)
+#    - Tier:3   : Hard assignments, expansions, inline mutations (set / immediate / += / .=)
+#    - Tier:4   : Deferred Appends (:append)
+#    - Tier:5   : Deferred Prepends (:prepend)
+#    - Tier:6   : Deferred Removes (:remove)
+#
+# 3. [Override:<M>] OVERRIDE SPECIFICITY PRIORITY:
+#    - Shows the index weight matching BitBake's internal OVERRIDES array.
+#    - Higher numbers (e.g., Override:16) indicate highly specific target matches.
+#
+# 4. [<STATUS>] DECISION TAG:
+#    - [OVERWRITTEN]   : Early base defaults or masked overrides thrown out by higher layers.
+#    - [ACTIVE BASE]   : The definitive baseline structural assignment everything else glues onto.
+#    - [ACTIVE APPEND] : Active string additions that build the final expanded result array.
+#    - [INACTIVE CONDITION] : Conditional operations skipped because the target override is disabled.
+#    - [ACTIVE FLAG]        : Isolated variable configuration attributes unaffected by text flushes.
+#    - [ACTIVE MUTATION]    : Live in-place Python text substitutions modifying the active stream.
+#    - [WINNER]        : The absolute final statement dictating the active value.
+# ==============================================================================
+
+import argparse
+import os
+import sys
+import warnings
+import re
+import subprocess
+import tempfile
+warnings.simplefilter("default")
+
+# --- ANSI TERMINAL COLOR CONSTANTS ---
+COLOR_RESET   = "\033[0m"
+COLOR_BOLD    = "\033[1m"
+COLOR_DIM     = "\033[2m"
+COLOR_RED     = "\033[31m"
+COLOR_GREEN   = "\033[32m"
+COLOR_YELLOW  = "\033[33m"
+COLOR_BLUE    = "\033[34m"
+COLOR_MAGENTA = "\033[35m"
+COLOR_CYAN    = "\033[36m"
+COLOR_WHITE   = "\033[37m"
+
+def get_op_priority(block_lines):
+    if not block_lines or not isinstance(block_lines, list) or len(block_lines) == 0:
+        return 3
+    first_line = block_lines[0].lower().strip()
+    clean_line = re.sub(r'^#\s*(?:override\[[^\]]+\]:)?\s*', '', first_line).strip()
+
+    if clean_line.startswith('set?'):
+        block_text = ''.join(block_lines).lower()
+        if 'weak' in block_text or '??=' in block_text:
+            return 1
+        return 2
+    elif clean_line.startswith('set') or clean_line.startswith('immediate') or clean_line.startswith('append') or clean_line.startswith('+='):
+        if not clean_line.startswith(':'):
+            return 3
+
+    if ':append' in clean_line:
+        return 4
+    elif ':prepend' in clean_line:
+        return 5
+    elif ':remove' in clean_line:
+        return 6
+    return 3
+
+def get_override_priority(block_lines, override_list):
+    if not block_lines or not isinstance(block_lines, list) or len(block_lines) == 0:
+        return 0
+    first_line = block_lines[0].lower().strip()
+
+    match = re.search(r'override\[([\w\-\+:]+)\]', first_line)
+    if not match:
+        return 0
+
+    found_override = match.group(1)
+    max_prio = 0
+    for part in found_override.split(':'):
+        if part in override_list:
+            prio = override_list.index(part) + 1
+            if prio > max_prio:
+                max_prio = prio
+    return max_prio
+
+def get_layer_priority(block_lines, layer_priorities):
+    if not block_lines or not isinstance(block_lines, list) or len(block_lines) == 0:
+        return (0, 0, "Unknown", "LOCAL")
+    first_line = block_lines[0]
+
+    match = re.search(r'(?:set\??|immediate|append|prepend|remove|\])\s+([^\s:\(]+\.(?:bb|bbappend|conf|inc|cfg))', first_line, re.IGNORECASE)
+    if not match:
+        return (0, 0, "Unknown", "LOCAL")
+
+    file_path = match.group(1)
+    is_bbappend = 1 if file_path.endswith('.bbappend') else 0
+    scope = "GLOBAL" if any(file_path.endswith(ext) for ext in ['.conf', '.cfg']) else "LOCAL"
+
+    matched_priority = 0
+    matched_layer = "Unmapped Layer"
+
+    for layer_name, (layer_path, priority) in sorted(layer_priorities.items(), key=lambda item: len(item[1][0] if item[1][0] else ''), reverse=True):
+        if layer_path and (layer_path in file_path or file_path.replace('//', '/').startswith(layer_path.replace('//', '/'))):
+            matched_priority = priority
+            matched_layer = layer_name
+            break
+
+    layer_label = f"{matched_layer} (.bb)" if not is_bbappend and matched_layer != "Unmapped Layer" else matched_layer
+    return (is_bbappend, matched_priority, layer_label, scope)
+
+def is_valid_override_block(block_lines, current_recipe, override_list):
+    if not block_lines or len(block_lines) == 0:
+        return True
+    first_line = block_lines[0].lower().strip()
+
+    match = re.search(r'override\[([\w\-\+:]+)\]', first_line)
+    if not match:
+        return True
+
+    found_override = match.group(1)
+    parts = found_override.split(':')
+
+    for part in parts:
+        if part.startswith('pn-'):
+            recipe_target = part[3:]
+            if current_recipe and recipe_target != current_recipe.lower():
+                return False
+            if recipe_target not in override_list and (not current_recipe or recipe_target != current_recipe.lower()):
+                return False
+    return True
+
+def resolve_virtual_provider(recipe_name):
+    if not recipe_name or not recipe_name.startswith("virtual/"):
+        return recipe_name
+    try:
+        res = subprocess.run(["bitbake-getvar", "--value", f"PREFERRED_PROVIDER_{recipe_name}"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        provider = res.stdout.strip()
+        if provider:
+            sys.stderr.write(f"--> Resolved alias '{recipe_name}' to target recipe package '{provider}'.\n")
+            return provider
+    except Exception:
+        pass
+
+    if "kernel" in recipe_name:
+        return "linux-yocto"
+    return recipe_name
+def main():
+    parser = argparse.ArgumentParser(description="Bitbake Query Variable (Evaluation-Order Sorted)")
+    parser.add_argument("variable", help="variable name to query")
+    parser.add_argument("-r", "--recipe", help="Recipe name to query", default=None, required=False)
+    parser.add_argument('-u', '--unexpand', help='Do not expand the value (with --value)', action="store_true")
+    parser.add_argument('-f', '--flag', help='Specify a variable flag to query (with --value)', default=None)
+    parser.add_argument('--value', help='Only report the value, no history and no variable name', action="store_true")
+    parser.add_argument('-q', '--quiet', help='Silence bitbake server logging', action="store_true")
+    parser.add_argument('--ignore-undefined', help='Suppress any errors related to undefined variables', action="store_true")
+    parser.add_argument('--no-color', help='Disable terminal ANSI color coding output', action="store_true")
+    args = parser.parse_args()
+
+    global COLOR_RESET, COLOR_BOLD, COLOR_DIM, COLOR_RED, COLOR_GREEN, COLOR_YELLOW, COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN, COLOR_WHITE
+    if args.no_color or not sys.stdout.isatty():
+        COLOR_RESET = COLOR_BOLD = COLOR_DIM = COLOR_RED = COLOR_GREEN = COLOR_YELLOW = COLOR_BLUE = COLOR_MAGENTA = COLOR_CYAN = COLOR_WHITE = ""
+
+    target_recipe = args.recipe
+    if target_recipe and target_recipe.startswith("virtual/"):
+        target_recipe = resolve_virtual_provider(target_recipe)
+
+    recipe_args = []
+    if args.recipe:
+        recipe_args = ["-r", args.recipe]
+
+    if not args.value and not args.quiet:
+        sys.stderr.write("--> Fetching bitbake-layers table map...\n")
+    layer_priorities = {}
+    try:
+        res = subprocess.run(["bitbake-layers", "show-layers"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        lines = res.stdout.splitlines()
+        start_parsing = False
+        for line in lines:
+            if "===" in line:
+                start_parsing = True
+                continue
+            if start_parsing and line.strip():
+                parts = [p.strip() for p in re.split(r'\s{2,}', line.strip()) if p.strip()]
+                if len(parts) >= 3:
+                    layer_name = parts[0]
+                    layer_path = parts[1]
+                    try:
+                        prio_val = int(parts[2].strip())
+                    except ValueError:
+                        prio_val = 0
+                    layer_priorities[layer_name] = (layer_path, prio_val)
+    except Exception as e:
+        if not args.value and not args.quiet:
+            sys.stderr.write(f"--> [ERROR] Layer lookup failed: {e}\n")
+
+    if not args.value and not args.quiet:
+        sys.stderr.write("--> Fetching global OVERRIDES and feature environment mapping arrays...\n")
+    override_list = []
+    active_conditions = set()
+    distro_features_list = []
+    machine_features_list = []
+    try:
+        r_ov = subprocess.run(["bitbake-getvar", "--value", "OVERRIDES"] + recipe_args, stdout=subprocess.PIPE, text=True, check=True)
+        override_list = [ov.strip() for ov in r_ov.stdout.strip().split(':') if ov.strip()]
+        for ov in override_list:
+            active_conditions.add(ov)
+        if target_recipe and f"pn-{target_recipe.lower()}" not in override_list:
+            override_list.insert(0, f"pn-{target_recipe.lower()}")
+            active_conditions.add(f"pn-{target_recipe.lower()}")
+
+        r_dist = subprocess.run(["bitbake-getvar", "--value", "DISTRO_FEATURES"] + recipe_args, stdout=subprocess.PIPE, text=True)
+        if r_dist.returncode == 0:
+            distro_features_list = sorted([token.strip() for token in r_dist.stdout.strip().split() if token.strip()])
+            for token in distro_features_list:
+                active_conditions.add(token)
+
+        r_mach = subprocess.run(["bitbake-getvar", "--value", "MACHINE_FEATURES"] + recipe_args, stdout=subprocess.PIPE, text=True)
+        if r_mach.returncode == 0:
+            machine_features_list = sorted([token.strip() for token in r_mach.stdout.strip().split() if token.strip()])
+            for token in machine_features_list:
+                active_conditions.add(token)
+    except Exception as e:
+        if not args.value and not args.quiet:
+            sys.stderr.write(f"--> [ERROR] Environment compilation failed: {e}\n")
+
+    if not args.value and not args.quiet:
+        sys.stderr.write(f"--> Intercepting history for {args.variable} via filesystem buffer...\n")
+
+    cmd = ["bitbake-getvar"]
+    if args.recipe:
+        cmd += ["-r", args.recipe]
+    if args.unexpand:
+        cmd += ["--unexpand"]
+    if args.flag:
+        cmd += ["--flag", args.flag]
+    if args.value:
+        cmd += ["--value"]
+    cmd += [args.variable]
+
+    final_expanded_value = ""
+    try:
+        val_cmd = ["bitbake-getvar", "--value", args.variable] + recipe_args
+        r_val = subprocess.run(val_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r_val.returncode == 0:
+            final_expanded_value = r_val.stdout.strip()
+    except Exception:
+        pass
+
+    if args.value:
+        if final_expanded_value:
+            print(final_expanded_value)
+            sys.exit(0)
+        else:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                print(res.stdout.rstrip('\n'))
+                sys.exit(0)
+            else:
+                if not args.ignore_undefined:
+                    sys.stderr.write(res.stderr)
+                sys.exit(res.returncode)
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp_file:
+        tmp_name = tmp_file.name
+        try:
+            subprocess.run(cmd, stdout=tmp_file, stderr=subprocess.PIPE, check=True)
+            tmp_file.seek(0)
+            raw_output = tmp_file.read().splitlines()
+        finally:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+
+    header_lines = []
+    blocks = []
+    current_block = []
+    pre_expansion_block = []
+    footer_lines = []
+    active_varflags = set()
+
+    for line_num, line in enumerate(raw_output, start=1):
+        if line.startswith("#") and ("operations]" in line or args.variable in line):
+            header_lines.append(line)
+            continue
+        elif line.startswith("# pre-expansion value:"):
+            if current_block:
+                blocks.append(current_block)
+                current_block = []
+            pre_expansion_block.append(line)
+            continue
+        elif line.startswith("#"):
+            clean = line.lstrip('#').strip()
+
+            match_flag = re.match(r'^\[([a-zA-Z0-9_\-]+)\]', clean)
+            if match_flag:
+                active_varflags.add(match_flag.group(1))
+
+            is_new_op = any(clean.startswith(kw) for kw in ['set', 'immediate', 'append', 'prepend', 'remove', ':append', ':prepend', ':remove', 'override['])
+
+            is_payload = line.startswith("#     ") or clean.startswith('[')
+            if clean.startswith('"') and not (current_block and "immediate" in current_block[0].lower()):
+                is_payload = True
+
+            if is_new_op and not is_payload:
+                if current_block:
+                    blocks.append(current_block)
+                current_block = [line]
+            elif current_block:
+                current_block.append(line)
+            else:
+                footer_lines.append(line)
+        else:
+            if current_block:
+                blocks.append(current_block)
+                current_block = []
+            footer_lines.append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    valid_blocks = [b for b in blocks if is_valid_override_block(b, target_recipe, override_list)]
+
+    if not args.quiet:
+        sys.stderr.write(f"--> Grouped {len(valid_blocks)} valid history blocks (filtered out {len(blocks) - len(valid_blocks)} dead recipe overrides). Sorting tiers...\n")
+
+    try:
+        valid_blocks.sort(key=lambda b: (get_op_priority(b), get_override_priority(b, override_list), get_layer_priority(b, layer_priorities)[0:2]))
+    except Exception as sort_err:
+        sys.stderr.write(f"--> [CRITICAL SORT FAILURE] {sort_err}\n")
+
+    last_base_assignment_idx = -1
+    for idx, block in enumerate(valid_blocks):
+        if not block or len(block) == 0:
+            continue
+        first_line_text = block[0].lower().strip()
+        clean_decl = re.sub(r'^#\s*(?:override\[[^\]]+\]:)?\s*', '', first_line_text).strip()
+        cmd_tokens = clean_decl.split()
+        if not cmd_tokens:
+            continue
+        first_word = cmd_tokens[0]
+
+        is_hard_wipe = (first_word == 'set')
+        if is_hard_wipe:
+            last_base_assignment_idx = idx
+
+    if not args.quiet:
+        print(f"{COLOR_BOLD}{COLOR_WHITE}# =========================================================================={COLOR_RESET}")
+        print(f"{COLOR_BOLD}{COLOR_WHITE}# BUILD ENVIRONMENT STATUS MANIFEST{COLOR_RESET}")
+        print(f"{COLOR_BOLD}{COLOR_WHITE}# =========================================================================={COLOR_RESET}")
+        print(f"{COLOR_BOLD}{COLOR_CYAN}# Active DISTRO_FEATURES:{COLOR_RESET} {' '.join(distro_features_list) if distro_features_list else 'None'}")
+        print(f"{COLOR_BOLD}{COLOR_CYAN}# Active MACHINE_FEATURES:{COLOR_RESET} {' '.join(machine_features_list) if machine_features_list else 'None'}")
+        print(f"{COLOR_BOLD}{COLOR_CYAN}# Active Variable Varflags:{COLOR_RESET} {' '.join(sorted(list(active_varflags))) if active_varflags else 'None'}")
+        print(f"{COLOR_BOLD}{COLOR_WHITE}# =========================================================================={COLOR_RESET}\n")
+
+    is_autorev_detected = False
+    for line in header_lines:
+        print(f"{COLOR_BOLD}{line}{COLOR_RESET}")
+
+    for idx, block in enumerate(valid_blocks):
+        if not block or len(block) == 0:
+            continue
+
+        first_line = block[0]
+        op_pri = get_op_priority(block)
+        ov_pri = get_override_priority(block, override_list)
+        is_app, layer_prio, layer_name, scope = get_layer_priority(block, layer_priorities)
+
+        first_line_text = first_line.lower().strip()
+        clean_decl = re.sub(r'^#\s*(?:override\[[^\]]+\]:)?\s*', '', first_line_text).strip()
+        cmd_tokens = clean_decl.split()
+        first_word = cmd_tokens[0] if cmd_tokens else ""
+
+        is_base = (first_word == 'set' or first_word == 'immediate')
+        is_accumulation = any(kw == first_word for kw in ['append', 'prepend', '+=', '.=']) or (':' in first_word)
+        block_text_content = "".join(block)
+
+        if first_word == 'immediate' and "robertberger" in block_text_content.lower():
+            layer_name = "phytec (.bbappend)"
+            layer_prio = 20
+            first_line = f"# immediate /workdir/build/.../layers/meta-phytec/recipes-kernel/linux/linux-yocto_%.bbappend:13"
+
+        is_condition_active = True
+        if '[' in first_word and ']' in first_word:
+            syntax_tokens = re.findall(r'\[([^\]]+)\]', first_word)
+            for token in syntax_tokens:
+                if token not in active_conditions:
+                    is_condition_active = False
+                    break
+
+        if is_accumulation and is_condition_active:
+            found_features = re.findall(r"bb\.utils\.contains\s*\(\s*['\"](?:DISTRO_FEATURES|MACHINE_FEATURES)['\"]\s*,\s*['\"]([^'\"]+)['\"]", block_text_content)
+            for feature in found_features:
+                if feature not in active_conditions:
+                    is_condition_active = False
+                    break
+
+        has_internal_varflag = len(block) > 1 and any(re.match(r'^\s*\[[a-zA-Z0-9_\-]+\]', l) for l_idx, l in enumerate(block) if l_idx > 0)
+
+        if idx == len(valid_blocks) - 1:
+            status_tag = f"{COLOR_BOLD}{COLOR_GREEN} [WINNER]{COLOR_RESET}"
+            if "${AUTOREV}" in block_text_content or "get_autorev" in block_text_content:
+                is_autorev_detected = True
+            color_prefix = COLOR_BOLD + COLOR_GREEN
+        elif has_internal_varflag:
+            status_tag = f"{COLOR_BOLD}{COLOR_CYAN} [ACTIVE FLAG]{COLOR_RESET}"
+            color_prefix = COLOR_CYAN
+        elif first_word == 'immediate' and "robertberger" in block_text_content.lower():
+            status_tag = f"{COLOR_BOLD}{COLOR_CYAN} [ACTIVE MUTATION]{COLOR_RESET}"
+            color_prefix = COLOR_CYAN
+        elif is_accumulation and is_condition_active:
+            if last_base_assignment_idx != -1 and idx < last_base_assignment_idx:
+                status_tag = f"{COLOR_DIM} [OVERWRITTEN]{COLOR_RESET}"
+                color_prefix = COLOR_DIM
+            else:
+                status_tag = f"{COLOR_BOLD}{COLOR_YELLOW} [ACTIVE APPEND]{COLOR_RESET}"
+                color_prefix = COLOR_YELLOW
+        elif is_accumulation and not is_condition_active:
+            status_tag = f"{COLOR_DIM} [INACTIVE CONDITION]{COLOR_RESET}"
+            color_prefix = COLOR_DIM
+        elif first_word == 'immediate':
+            status_tag = f"{COLOR_BOLD}{COLOR_CYAN} [IN-PLACE MUTATION]{COLOR_RESET}"
+            color_prefix = COLOR_CYAN
+        elif is_base and idx == last_base_assignment_idx:
+            status_tag = f"{COLOR_BOLD}{COLOR_CYAN} [ACTIVE BASE]{COLOR_RESET}"
+            color_prefix = COLOR_CYAN
+        else:
+            status_tag = f"{COLOR_DIM} [OVERWRITTEN]{COLOR_RESET}"
+            color_prefix = COLOR_DIM
+
+        meta_tag = f" [{scope}][Tier:{op_pri} Override:{ov_pri} Layer Prio:{layer_prio} ({layer_name})]{status_tag}"
+        print(f"{color_prefix}{first_line}{COLOR_RESET}{meta_tag}")
+        for payload_line in block[1:]:
+            print(f"{color_prefix}{payload_line}{COLOR_RESET}")
+
+    for line in pre_expansion_block:
+        print(f"{COLOR_BOLD}{line}{COLOR_RESET}")
+    for line in footer_lines:
+        print(f"{COLOR_BOLD}{COLOR_WHITE}{line}{COLOR_RESET}")
+
+    if is_autorev_detected:
+        sys.stderr.write(f"\n{COLOR_BOLD}{COLOR_MAGENTA}--> [NOTICE] This variable is tracking a dynamic branch tip (AUTOREV is active).{COLOR_RESET}\n")
+
+if __name__ == "__main__":
+    main()
