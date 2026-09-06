@@ -1,0 +1,28 @@
+# hashsrv-walnascar
+version: "3"
+
+networks:
+  hashsrv-walnascar-app-net:
+    external: false
+
+services:
+  hashsrv-walnascar-server:
+    image: reliableembeddedsystems/hashsrv-container:2024-11-21-hashsrv-bb-2.9.1
+    container_name: hashsrv-walnascar
+    restart: always
+    networks:
+      - hashsrv-walnascar-app-net
+    volumes:
+      - /appdata/hashsrv-walnascar/workdir:/workdir
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "8688:8687"
+    command:
+      - --bind
+      - :8687
+      - --database
+      - /workdir/hashserv.db
+      - --log
+      - WARNING

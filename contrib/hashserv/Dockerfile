@@ -16,7 +16,9 @@ RUN apk add --no-cache python3 py3-websockets libgcc
 COPY bin/bitbake-hashserv /opt/bbhashserv/bin/
 COPY lib/hashserv /opt/bbhashserv/lib/hashserv/
 COPY lib/bb /opt/bbhashserv/lib/bb/
-COPY lib/ply /opt/bbhashserv/lib/ply/
-COPY lib/bs4 /opt/bbhashserv/lib/bs4/
+#COPY lib/ply /opt/bbhashserv/lib/ply/
+COPY lib/bb/_vendor/ply /opt/bbhashserv/lib/ply/
+#COPY lib/bs4 /opt/bbhashserv/lib/bs4/
+COPY lib/bb/_vendor/bs4 /opt/bbhashserv/lib/bs4/
 
 ENTRYPOINT ["/opt/bbhashserv/bin/bitbake-hashserv"]
