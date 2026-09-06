@@ -1,0 +1,23 @@
+# prsrv-walnascar
+version: "3"
+
+networks:
+  prsrv-walnascar-app-net:
+    external: false
+
+services:
+  prsrv-walnascar-server:
+    image: reliableembeddedsystems/prsrv-container:2024-11-21-prsrv-bb-2.9.1
+    container_name: prsrv-walnascar
+    restart: always
+    networks:
+      - prsrv-walnascar-app-net
+    volumes:
+      - /appdata/prsrv-walnascar/workdir:/var/lib/bbprserv
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "18586:18585"
+    environment:
+      - PORT=18585

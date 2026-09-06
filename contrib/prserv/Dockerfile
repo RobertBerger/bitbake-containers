@@ -35,8 +35,10 @@ RUN apk add --no-cache python3
 COPY bin/bitbake-prserv /opt/bbprserv/bin/
 COPY lib/prserv /opt/bbprserv/lib/prserv/
 COPY lib/bb /opt/bbprserv/lib/bb/
-COPY lib/ply /opt/bbprserv/lib/ply/
-COPY lib/bs4 /opt/bbprserv/lib/bs4/
+#COPY lib/ply /opt/bbprserv/lib/ply/
+COPY lib/bb/_vendor/ply /opt/bbprserv/lib/ply/
+#COPY lib/bs4 /opt/bbprserv/lib/bs4/
+COPY lib/bb/_vendor/bs4 /opt/bbprserv/lib/bs4/
 
 ENV PATH=$PATH:/opt/bbprserv/bin
 
